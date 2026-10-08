@@ -30,4 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build keeper-fw
-        run: idf.py -C fw build
+        # The container job bypasses the image entrypoint, so the IDF
+        # environment (idf.py on PATH) must be sourced by hand.
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C fw build
