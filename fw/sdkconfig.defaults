@@ -1,0 +1,17 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# ESP32-S3 SuperMini — 4MB flash (проверено: чип generic 4096k)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Firmware's own debug console goes to UART0 (SuperMini "TX"/"RX" pins,
+# 115200) and never to the USB data channel, so the USB stream stays clean
+# protocol-only. To debug boot problems via `idf.py monitor`, temporarily
+# switch to: CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_UART_ISR_IN_IRAM=y

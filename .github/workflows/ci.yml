@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  control:
+    name: CLI: build, unit, fuzz, e2e, stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CLI
+        run: make -C control
+      - name: Unit tests (frame parser)
+        run: make -C control check
+      - name: Fuzz (ASan/UBSan)
+        run: make -C control fuzz
+      - name: e2e against mock dongle
+        run: python3 e2e_test.py
+      - name: Stress against hostile mock dongle
+        run: python3 stress_test.py
+
+  firmware:
+    name: Firmware: ESP-IDF v5.5 build
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build keeper-fw
+        run: idf.py -C fw build

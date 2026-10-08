@@ -1,0 +1,13 @@
+# ESP-IDF local install and toolchains
+.esp-idf/
+.idf-tools/
+
+# Build artifacts
+fw/build/
+fw/sdkconfig
+fw/sdkconfig.old
+fw/dependencies.lock
+control/build/
+
+# Python
+__pycache__/
