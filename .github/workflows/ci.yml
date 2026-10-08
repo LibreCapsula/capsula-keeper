@@ -7,7 +7,7 @@ on:
 
 jobs:
   control:
-    name: CLI: build, unit, fuzz, e2e, stress
+    name: "CLI: build, unit, fuzz, e2e, stress"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
         run: python3 stress_test.py
 
   firmware:
-    name: Firmware: ESP-IDF v5.5 build
+    name: "Firmware: ESP-IDF v5.5 build"
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5
