@@ -8,6 +8,7 @@ fw/sdkconfig
 fw/sdkconfig.old
 fw/dependencies.lock
 control/build/
+dist/
 
 # Python
 __pycache__/

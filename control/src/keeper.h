@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KEEPER_VERSION "0.2.0"
+#define KEEPER_VERSION "1.0.0"
 
 /* Wire protocol (device -> host), mirrors fw/main/proto.h:
  *   [SOF 0x5A][type u8][len u16 LE][payload...]

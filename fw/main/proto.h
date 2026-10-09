@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "keeper-fw 0.2.0"
+#define FW_VERSION "keeper-fw 1.0.0"
 
 // Wire protocol (device -> host): binary frames
 //   [SOF 0x5A][type u8][len u16 LE][payload...]
