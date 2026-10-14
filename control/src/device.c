@@ -24,6 +24,7 @@ struct device {
 
     uint8_t pending[PENDING_MAX];
     size_t pending_len;
+    size_t pending_dropped; /* bytes lost because `pending` was full */
 
     int (*log_cb)(const uint8_t *data, size_t len, void *user);
     void *log_user;
@@ -31,6 +32,28 @@ struct device {
 
     char err[256];
 };
+
+static long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* stdout is fully buffered (see main()): under a target log flood a flush
+ * per frame throttles the whole pipeline, but the user still wants output
+ * within tens of milliseconds — flush on a fixed cadence instead. */
+#define FLUSH_PERIOD_MS 50
+
+static void paced_flush(void)
+{
+    static long next_flush;
+    long now = now_ms();
+    if (now >= next_flush) {
+        fflush(stdout);
+        next_flush = now + FLUSH_PERIOD_MS;
+    }
+}
 
 static void set_deadline(struct timespec *ts, long ms)
 {
@@ -73,16 +96,17 @@ static void on_frame(uint8_t type, const uint8_t *payload, size_t len,
         push_ctrl(d, payload, len);
     } else if (type == PKT_TYPE_LOG) {
         if (d->capture != NULL) {
-            fwrite(payload, 1, len, d->capture);
-            fflush(d->capture);
+            fwrite(payload, 1, len, d->capture); /* flushed on close */
         }
         if (d->logging && d->log_cb != NULL) {
             if (d->log_cb(payload, len, d->log_user)) {
                 d->logging = 0;
             }
-        } else if (d->pending_len < PENDING_MAX) {
+        } else if (d->pending_len + len <= PENDING_MAX) {
             memcpy(d->pending + d->pending_len, payload, len);
             d->pending_len += len;
+        } else {
+            d->pending_dropped += len;
         }
     }
 }
@@ -102,7 +126,7 @@ static int pump(device_t *d, int timeout_ms)
     if (pr == 0) {
         return 0;
     }
-    uint8_t buf[1024];
+    uint8_t buf[8192]; /* one read per poll wakeup must move a full burst */
     ssize_t n = read(d->fd, buf, sizeof(buf));
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -257,6 +281,7 @@ int device_command(device_t *d, const char *cmd, long timeout_ms, char *reply,
                 snprintf(reply, reply_sz, "%s", d->err);
                 return -1;
             }
+            paced_flush(); /* LOG frames may stream while we wait */
         }
         if (attempt + 1 >= CMD_ATTEMPTS) {
             snprintf(reply, reply_sz, "timeout waiting for reply to @%s", cmd);
@@ -271,12 +296,29 @@ int device_send_console(device_t *d, const uint8_t *data, size_t n)
     return write_all(d, data, n, reply, sizeof(reply));
 }
 
+void device_set_log_callback(device_t *d,
+                             int (*cb)(const uint8_t *data, size_t len,
+                                       void *user),
+                             void *user)
+{
+    d->log_cb = cb;
+    d->log_user = user;
+    d->logging = 1;
+}
+
 int device_log_loop(device_t *d,
                     int (*cb)(const uint8_t *data, size_t len, void *user),
                     void *user, const volatile int *stop, long timeout_ms)
 {
     d->log_cb = cb;
     d->log_user = user;
+    if (d->pending_dropped > 0) {
+        fprintf(stderr,
+                "capsula-keeper: warning: %zu bytes of early logs dropped "
+                "(pending buffer full)\n",
+                d->pending_dropped);
+        d->pending_dropped = 0;
+    }
     /* First deliver whatever accumulated while nobody was streaming
      * (boot logs that arrived during a preceding command, e.g. RESET). */
     if (d->pending_len > 0 && !d->logging) {
@@ -302,6 +344,7 @@ int device_log_loop(device_t *d,
             return 0;
         }
         int rc = pump(d, 100);
+        paced_flush();
         if (rc < 0) {
             return -1;
         }

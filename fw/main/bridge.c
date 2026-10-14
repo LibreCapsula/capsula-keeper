@@ -23,9 +23,11 @@
 #define LOG_TASK_STACK 4096
 #define CMD_TASK_STACK 4096
 
+// TX room must ride out host-side hiccups (terminal rendering, scheduler
+// bursts): at a 1.5 Mbaud target flood every ms of stall eats ~150 bytes.
 #define USJ_RX_BUF 4096
-#define USJ_TX_BUF 8192
-#define UART_RX_BUF 8192
+#define USJ_TX_BUF 32768
+#define UART_RX_BUF 16384
 #define UART_TX_BUF 1024
 
 #define DEFAULT_RESET_MS 1000
@@ -46,8 +48,48 @@ static volatile uint32_t s_drops = 0;
 static volatile uint32_t s_rx_total = 0;
 static volatile uint32_t s_baud = TARGET_UART_BAUD;
 
-// CTRL replies must get through even when the LOG stream saturates the USJ
-// TX buffer: wait much longer than a log chunk ever would.
+// Frames are all-or-nothing: if a payload is abandoned half-written, the
+// host parser consumes the FOLLOWING frames as this one's payload (garbled
+// output and cascading loss). Header+payload therefore go to the USJ driver
+// as one contiguous block, retried until the budget expires; only then is
+// the remainder dropped and counted. CTRL gets a much larger budget than
+// LOG so replies survive a log flood saturating the TX buffer.
+#define CTRL_SEND_BUDGET_MS 2000
+#define LOG_SEND_BUDGET_MS 250
+
+static void send_frame(uint8_t type, const uint8_t *data, size_t len,
+                       uint32_t budget_ms)
+{
+    uint8_t pkt[4 + LOG_CHUNK];
+    if (len > LOG_CHUNK) {
+        s_drops++;
+        return;
+    }
+    pkt[0] = PKT_SOF;
+    pkt[1] = type;
+    pkt[2] = (uint8_t)(len & 0xFF);
+    pkt[3] = (uint8_t)(len >> 8);
+    memcpy(pkt + 4, data, len);
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(budget_ms);
+    size_t total = 4 + len;
+    size_t off = 0;
+    while (off < total) {
+        TickType_t left = deadline - xTaskGetTickCount();
+        if ((int32_t)left <= 0) {
+            break;
+        }
+        int w = usb_serial_jtag_write_bytes(pkt + off, total - off, left);
+        if (w < 0) {
+            break;
+        }
+        off += (size_t)w;
+    }
+    if (off != total) {
+        s_drops++;
+    }
+}
+
 static void send_ctrl(const char *fmt, ...)
 {
     char buf[160];
@@ -61,31 +103,15 @@ static void send_ctrl(const char *fmt, ...)
     if (n >= (int)sizeof(buf)) {
         n = sizeof(buf) - 1;
     }
-    uint8_t hdr[4] = {PKT_SOF, PKT_TYPE_CTRL, (uint8_t)(n & 0xFF),
-                      (uint8_t)((n >> 8) & 0xFF)};
-    int w1 = usb_serial_jtag_write_bytes(hdr, sizeof(hdr), pdMS_TO_TICKS(2000));
-    int w2 = (w1 == (int)sizeof(hdr))
-                 ? usb_serial_jtag_write_bytes(buf, n, pdMS_TO_TICKS(2000))
-                 : 0;
-    if (w1 != (int)sizeof(hdr) || w2 != n) {
-        s_drops++;
-    }
+    send_frame(PKT_TYPE_CTRL, (const uint8_t *)buf, (size_t)n,
+               CTRL_SEND_BUDGET_MS);
 }
 
-// Logs are best-effort: never block long on a full TX buffer, that starves
-// the command task and delays CTRL replies (the host resyncs on the next
-// SOF). Undelivered chunks are counted as drops.
+// Logs are best-effort (bounded budget, drops counted in @STAT), but never
+// half-sent — see send_frame().
 static void send_log(const uint8_t *data, size_t len)
 {
-    uint8_t hdr[4] = {PKT_SOF, PKT_TYPE_LOG, (uint8_t)(len & 0xFF),
-                      (uint8_t)(len >> 8)};
-    int w1 = usb_serial_jtag_write_bytes(hdr, sizeof(hdr), pdMS_TO_TICKS(10));
-    int w2 = (w1 == (int)sizeof(hdr))
-                 ? usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(20))
-                 : 0;
-    if (w1 != (int)sizeof(hdr) || w2 != (int)len) {
-        s_drops++;
-    }
+    send_frame(PKT_TYPE_LOG, data, len, LOG_SEND_BUDGET_MS);
 }
 
 // Target UART -> host

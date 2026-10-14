@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KEEPER_VERSION "1.0.0"
+#define KEEPER_VERSION "1.0.1"
 
 /* Wire protocol (device -> host), mirrors fw/main/proto.h:
  *   [SOF 0x5A][type u8][len u16 LE][payload...]
@@ -71,6 +71,14 @@ int device_command(device_t *d, const char *cmd, long timeout_ms, char *reply,
 
 /* Raw bytes straight to the target console (must not start with '@'). */
 int device_send_console(device_t *d, const uint8_t *data, size_t n);
+
+/* Attach the LOG callback before a command is sent (e.g. RESET in
+ * 'reset --log'): boot logs then stream live while the reply is awaited
+ * instead of sitting in the bounded `pending` buffer. */
+void device_set_log_callback(device_t *d,
+                             int (*cb)(const uint8_t *data, size_t len,
+                                       void *user),
+                             void *user);
 
 /* Invoke cb() for every LOG frame until cb returns nonzero, *stop is set,
  * or timeout_ms elapses (timeout_ms <= 0: no deadline).

@@ -4,8 +4,11 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export IDF_PATH="${IDF_PATH:-$DIR/../.esp-idf}"
-export IDF_TOOLS_PATH="${IDF_TOOLS_PATH:-$DIR/../.idf-tools}"
+# Realpathed repo root: ESP-IDF's activation compares tool paths textually
+# and rejects a venv reached via a "fw/../.idf-tools"-style path.
+ROOT="$(cd "$DIR/.." && pwd)"
+export IDF_PATH="${IDF_PATH:-$ROOT/.esp-idf}"
+export IDF_TOOLS_PATH="${IDF_TOOLS_PATH:-$ROOT/.idf-tools}"
 
 if [ ! -f "$IDF_PATH/export.sh" ]; then
     echo "ESP-IDF not found at $IDF_PATH — run $DIR/setup.sh first" >&2

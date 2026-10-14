@@ -19,6 +19,13 @@ static void on_sigint(int sig)
     g_stop = 1;
 }
 
+static void arm_stop_signals(void)
+{
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+    g_stop = 0;
+}
+
 /* --- strict numeric option parsing ---------------------------------------- */
 
 static int parse_long(const char *s, long *out)
@@ -168,6 +175,7 @@ static int run_cmd_retry(const char *port, const char *cmd, long timeout_ms,
         device_close(d);
         if (rc == 0) {
             printf("%s\n", reply);
+            fflush(stdout); /* callers may block on USB checks next */
             return 0;
         }
         if (rc < 0 && attempt < retries) {
@@ -197,8 +205,145 @@ static int cmd_ports(void)
     return 0;
 }
 
-static int run_log_stream(device_t *d, const char *until, const char *timeout_s,
-                          const char *max_lines_s, int raw);
+/* --- log --- */
+
+typedef struct {
+    regex_t *rx;
+    char line[8192];
+    size_t llen;
+    int matched;
+    long max_lines; /* 0 = unlimited */
+    long lines;     /* completed lines so far */
+    int limit_hit;
+    int raw; /* write bytes through immediately, even while --until matches */
+} logctx_t;
+
+static int log_cb(const uint8_t *data, size_t len, void *user)
+{
+    logctx_t *c = user;
+    if (c->raw) {
+        fwrite(data, 1, len, stdout);
+    }
+    for (size_t i = 0; i < len; i++) {
+        uint8_t ch = data[i];
+        if (ch != '\n') {
+            if (c->rx != NULL && c->llen < sizeof(c->line) - 1) {
+                c->line[c->llen++] = (char)ch;
+            }
+            continue;
+        }
+        /* a complete line ends here */
+        c->lines++;
+        int stop = 0;
+        if (c->rx != NULL) {
+            if (c->llen >= sizeof(c->line)) {
+                c->llen = sizeof(c->line) - 1;
+            }
+            c->line[c->llen] = '\0';
+            if (regexec(c->rx, c->line, 0, NULL, 0) == 0) {
+                c->matched = 1;
+                stop = 1;
+            }
+            c->llen = 0;
+        }
+        if (!stop && c->max_lines > 0 && c->lines >= c->max_lines) {
+            c->limit_hit = 1;
+            stop = 1;
+        }
+        if (stop) {
+            if (!c->raw) {
+                fwrite(data, 1, i + 1, stdout); /* through the newline */
+            }
+            return 1;
+        }
+    }
+    if (!c->raw) {
+        fwrite(data, 1, len, stdout);
+    }
+    return 0;
+}
+
+typedef struct {
+    regex_t rx;
+    int have_rx;
+    double timeout;
+    long max_lines;
+    logctx_t c;
+} logstream_t;
+
+/* Compile stream options; prints the error and returns -1 on a bad one. */
+static int logstream_begin(logstream_t *ls, const char *until,
+                          const char *timeout_s, const char *max_lines_s,
+                          int raw)
+{
+    memset(ls, 0, sizeof(*ls));
+    if (until != NULL && until[0] != '\0') {
+        if (regcomp(&ls->rx, until, REG_EXTENDED | REG_NOSUB) != 0) {
+            fprintf(stderr, "capsula-keeper: bad --until regex\n");
+            return -1;
+        }
+        ls->have_rx = 1;
+    }
+    if (timeout_s != NULL && parse_double(timeout_s, &ls->timeout) != 0) {
+        fprintf(stderr, "capsula-keeper: bad --timeout value\n");
+        goto fail;
+    }
+    if (max_lines_s != NULL &&
+        (parse_long(max_lines_s, &ls->max_lines) != 0 || ls->max_lines < 0)) {
+        fprintf(stderr, "capsula-keeper: bad --max-lines value\n");
+        goto fail;
+    }
+    ls->c.rx = ls->have_rx ? &ls->rx : NULL;
+    ls->c.raw = raw;
+    ls->c.max_lines = ls->max_lines;
+    return 0;
+fail:
+    if (ls->have_rx) {
+        regfree(&ls->rx);
+    }
+    return -1;
+}
+
+static void logstream_end(logstream_t *ls)
+{
+    if (ls->have_rx) {
+        regfree(&ls->rx);
+    }
+}
+
+/* Run the streaming loop and map the outcome to a process exit code. */
+static int logstream_run(device_t *d, logstream_t *ls)
+{
+    /* The stream may already be finished: with 'reset --log' the pattern
+     * can match while the RESET reply is still being awaited. */
+    if (ls->c.matched || ls->c.limit_hit) {
+        if (ls->c.limit_hit) {
+            fprintf(stderr, "capsula-keeper: --max-lines %ld reached\n",
+                    ls->max_lines);
+        }
+        return 0;
+    }
+    int rc = device_log_loop(d, log_cb, &ls->c, &g_stop,
+                             (long)(ls->timeout * 1000.0));
+    const char *ioerr = device_err(d);
+    if (ls->c.matched || ls->c.limit_hit) {
+        if (ls->c.limit_hit) {
+            fprintf(stderr, "capsula-keeper: --max-lines %ld reached\n",
+                    ls->max_lines);
+        }
+        return 0;
+    }
+    if (rc == 2) {
+        fprintf(stderr, "capsula-keeper: --timeout %gs reached\n", ls->timeout);
+        return 2;
+    }
+    if (rc < 0) {
+        fprintf(stderr, "\ncapsula-keeper: %s\n",
+                ioerr[0] ? ioerr : "i/o error");
+        return 1;
+    }
+    return 0;
+}
 
 static int cmd_reset(int argc, char **argv, const char *port)
 {
@@ -239,7 +384,8 @@ static int cmd_reset(int argc, char **argv, const char *port)
     /* Keep the port open across the reset: with close/reopen every byte the
      * dongle streams between the two opens (i.e. the very start of the boot)
      * would be lost. LOG frames arriving while we wait for the RESET reply
-     * are buffered by the device and drained by the log loop. */
+     * are streamed live — the log callback is attached before the command
+     * is sent (see below). */
     device_t *d = device_open(port, NULL, err, sizeof(err));
     if (d == NULL) {
         fprintf(stderr, "capsula-keeper: %s\n", err);
@@ -252,13 +398,32 @@ static int cmd_reset(int argc, char **argv, const char *port)
         device_close(d);
         return 1;
     }
-    printf("%s\n", reply);
-    fflush(stdout);
     /* --log's value (if given) acts as the --until pattern; a separate
      * --until also passes through. Plain --log just streams. */
     const char *until = vals[OPT_LOG][0] != '\0' ? vals[OPT_LOG] :
                         vals[OPT_UNTIL];
-    rc = run_log_stream(d, until, vals[OPT_TMOUT], vals[OPT_MAXL], 0);
+    logstream_t ls;
+    if (logstream_begin(&ls, until, vals[OPT_TMOUT], vals[OPT_MAXL], 0) != 0) {
+        device_close(d);
+        return 2;
+    }
+    /* Stream from the moment the port is open: boot logs must not sit in
+     * the bounded `pending` buffer (nor be lost when it overflows) while
+     * the RESET reply is awaited — that both delayed and holed the boot
+     * log at flood rates. */
+    arm_stop_signals();
+    device_set_log_callback(d, log_cb, &ls.c);
+    rc = device_command(d, cmd, ms + 3000, reply, sizeof(reply));
+    if (rc != 0) {
+        fprintf(stderr, "capsula-keeper: %s\n", reply);
+        logstream_end(&ls);
+        device_close(d);
+        return 1;
+    }
+    printf("%s\n", reply);
+    fflush(stdout);
+    rc = logstream_run(d, &ls);
+    logstream_end(&ls);
     device_close(d);
     return rc;
 }
@@ -554,8 +719,7 @@ static int cmd_send(int argc, char **argv, const char *port)
 static int telnet_print_cb(const uint8_t *data, size_t len, void *user)
 {
     (void)user;
-    fwrite(data, 1, len, stdout);
-    fflush(stdout);
+    fwrite(data, 1, len, stdout); /* flushed on a cadence by the log loop */
     return 0;
 }
 
@@ -596,9 +760,7 @@ static int cmd_telnet(int argc, char **argv, const char *port)
             "[telnet] console open; Ctrl-] quits, '@' is escaped "
             "automatically%s\n",
             timeout > 0 ? "" : " (no timeout)");
-    g_stop = 0;
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    arm_stop_signals();
 
     struct timespec dl;
     int have_dl = timeout_ms > 0;
@@ -673,137 +835,6 @@ static int cmd_telnet(int argc, char **argv, const char *port)
     return rc;
 }
 
-/* --- log --- */
-
-typedef struct {
-    regex_t *rx;
-    char line[8192];
-    size_t llen;
-    int matched;
-    long max_lines; /* 0 = unlimited */
-    long lines;     /* completed lines so far */
-    int limit_hit;
-    int raw; /* write bytes through immediately, even while --until matches */
-} logctx_t;
-
-static int log_cb(const uint8_t *data, size_t len, void *user)
-{
-    logctx_t *c = user;
-    if (c->raw) {
-        fwrite(data, 1, len, stdout);
-        fflush(stdout);
-    }
-    for (size_t i = 0; i < len; i++) {
-        uint8_t ch = data[i];
-        if (ch != '\n') {
-            if (c->rx != NULL && c->llen < sizeof(c->line) - 1) {
-                c->line[c->llen++] = (char)ch;
-            }
-            continue;
-        }
-        /* a complete line ends here */
-        c->lines++;
-        int stop = 0;
-        if (c->rx != NULL) {
-            if (c->llen >= sizeof(c->line)) {
-                c->llen = sizeof(c->line) - 1;
-            }
-            c->line[c->llen] = '\0';
-            if (regexec(c->rx, c->line, 0, NULL, 0) == 0) {
-                c->matched = 1;
-                stop = 1;
-            }
-            c->llen = 0;
-        }
-        if (!stop && c->max_lines > 0 && c->lines >= c->max_lines) {
-            c->limit_hit = 1;
-            stop = 1;
-        }
-        if (stop) {
-            if (!c->raw) {
-                fwrite(data, 1, i + 1, stdout); /* through the newline */
-                fflush(stdout);
-            }
-            return 1;
-        }
-    }
-    if (!c->raw) {
-        fwrite(data, 1, len, stdout);
-        fflush(stdout);
-    }
-    return 0;
-}
-
-/* Streams target logs from an already-open device until the pattern hits,
- * the line limit is reached, the timeout expires or Ctrl-C.
- * timeout_s/max_lines_s: string option values (NULL = defaults).
- * Returns the process exit code. */
-static int run_log_stream(device_t *d, const char *until, const char *timeout_s,
-                          const char *max_lines_s, int raw)
-{
-    regex_t rx;
-    int have_rx = 0;
-    if (until != NULL && until[0] != '\0') {
-        if (regcomp(&rx, until, REG_EXTENDED | REG_NOSUB) != 0) {
-            fprintf(stderr, "capsula-keeper: bad --until regex\n");
-            return 2;
-        }
-        have_rx = 1;
-    }
-    double timeout = 0;
-    if (timeout_s != NULL && parse_double(timeout_s, &timeout) != 0) {
-        fprintf(stderr, "capsula-keeper: bad --timeout value\n");
-        if (have_rx) {
-            regfree(&rx);
-        }
-        return 2;
-    }
-    long timeout_ms = (long)(timeout * 1000.0);
-    long max_lines = 0;
-    if (max_lines_s != NULL &&
-        (parse_long(max_lines_s, &max_lines) != 0 || max_lines < 0)) {
-        fprintf(stderr, "capsula-keeper: bad --max-lines value\n");
-        if (have_rx) {
-            regfree(&rx);
-        }
-        return 2;
-    }
-
-    logctx_t c = { .rx = have_rx ? &rx : NULL,
-                   .llen = 0,
-                   .matched = 0,
-                   .max_lines = max_lines,
-                   .lines = 0,
-                   .limit_hit = 0,
-                   .raw = raw };
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
-    g_stop = 0;
-
-    int rc = device_log_loop(d, log_cb, &c, &g_stop, timeout_ms);
-    const char *ioerr = device_err(d);
-    if (have_rx) {
-        regfree(&rx);
-    }
-    if (c.matched || c.limit_hit) {
-        if (c.limit_hit) {
-            fprintf(stderr, "capsula-keeper: --max-lines %ld reached\n",
-                    max_lines);
-        }
-        return 0;
-    }
-    if (rc == 2) {
-        fprintf(stderr, "capsula-keeper: --timeout %gs reached\n", timeout);
-        return 2;
-    }
-    if (rc < 0) {
-        fprintf(stderr, "\ncapsula-keeper: %s\n",
-                ioerr[0] ? ioerr : "i/o error");
-        return 1;
-    }
-    return 0;
-}
-
 static int cmd_log(int argc, char **argv, const char *port)
 {
     const optdef_t defs[] = { { "--until", 1 },     { "--timeout", 1 },
@@ -828,7 +859,15 @@ static int cmd_log(int argc, char **argv, const char *port)
         fprintf(stderr, "capsula-keeper: %s\n", open_err);
         return 1;
     }
-    int rc = run_log_stream(d, vals[0], vals[1], vals[3], vals[4] != NULL);
+    logstream_t ls;
+    int rc;
+    if (logstream_begin(&ls, vals[0], vals[1], vals[3], vals[4] != NULL) != 0) {
+        rc = 2;
+    } else {
+        arm_stop_signals();
+        rc = logstream_run(d, &ls);
+        logstream_end(&ls);
+    }
     device_close(d);
     return rc;
 }
@@ -837,6 +876,11 @@ static int cmd_log(int argc, char **argv, const char *port)
 
 int main(int argc, char **argv)
 {
+    /* Batch stdout: the stdio default on a tty flushes per newline, which
+     * throttles log streaming into a terminal. Interactive liveliness is
+     * kept by the paced flushes in device.c; one-shot prints are flushed
+     * where blocking follows (or by exit()). */
+    setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
     const char *port = getenv("KEEPER_PORT");
     int i = 1;
     for (; i < argc; i++) {
